@@ -244,6 +244,14 @@ io.on('connection', socket => {
     p.cells = [makeCell(rand(200, CFG.worldW-200), rand(200, CFG.worldH-200), CFG.playerStartMass, p.color, safeName)];
   });
 
+  socket.on('cheat_mass', ({ mass }) => {
+    const p = state.players.get(socket.id);
+    if (!p || p.dead || !p.cells.length) return;
+    const m = Math.max(8, Math.min(50000, Number(mass) || 100));
+    p.cells = [{ ...p.cells[0], mass: m, r: massToRadius(m), vx: 0, vy: 0 }];
+    console.log(`[cheat] ${p.name} set mass to ${m}`);
+  });
+
   socket.on('ping_', () => socket.emit('pong_'));
 
   socket.on('disconnect', () => {

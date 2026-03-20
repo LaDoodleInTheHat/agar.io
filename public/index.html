@@ -17,10 +17,9 @@
     border:1px solid rgba(255,255,255,0.1); pointer-events:none;
   }
   #leaderboard {
-    position:fixed; top:18px; right:18px;
-    background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.1);
-    border-radius:12px; padding:12px 16px; min-width:160px;
-    backdrop-filter:blur(6px); pointer-events:none;
+    position:fixed; top:18px; right:18px; background:rgba(0,0,0,0.55);
+    border:1px solid rgba(255,255,255,0.1); border-radius:12px; padding:12px 16px;
+    min-width:160px; backdrop-filter:blur(6px); pointer-events:none;
   }
   #leaderboard h3 { font-family:'Orbitron',monospace; font-size:10px; letter-spacing:3px; color:rgba(255,255,255,0.5); margin-bottom:10px; }
   #leaderboard-list { list-style:none; }
@@ -30,8 +29,7 @@
   #ping-display { position:fixed; bottom:18px; right:18px; font-size:11px; letter-spacing:2px; color:rgba(255,255,255,0.3); pointer-events:none; }
   #hint { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); font-size:12px; letter-spacing:2px; color:rgba(255,255,255,0.25); pointer-events:none; }
   #overlay {
-    position:fixed; inset:0; display:flex; flex-direction:column;
-    align-items:center; justify-content:center;
+    position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
     background:rgba(0,0,0,0.78); backdrop-filter:blur(4px); z-index:10;
   }
   #overlay h1 {
@@ -49,7 +47,7 @@
   #overlay button {
     background:linear-gradient(135deg,#3af 0%,#84f 100%); border:none; border-radius:8px;
     color:#fff; cursor:pointer; font-family:'Orbitron',monospace; font-size:13px;
-    letter-spacing:3px; padding:12px 32px; transition:opacity .2s, transform .15s;
+    letter-spacing:3px; padding:12px 32px; transition:opacity .2s,transform .15s;
   }
   #overlay button:hover { opacity:.85; transform:scale(1.04); }
   #overlay .note { font-size:12px; color:rgba(255,255,255,0.25); margin-top:18px; }
@@ -75,443 +73,379 @@
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
-window.addEventListener('resize', resize);
-resize();
+window.addEventListener('resize', resize); resize();
 
 const socket = io();
 
-// ─── Constants (mirror server) ────────────────────────────────────────────────
-const WORLD = 3000;
-const TICK_MS = 1000 / 30;
-const RENDER_DELAY = 300;          // ms behind for other-player interpolation
-const SPLIT_MOMENTUM_TICKS = 20;
-const SPLIT_MOMENTUM_DECAY = 0.80;
-const MERGE_COOLDOWN = 3000;
-const MAX_SPLIT = 4;
-const SPLIT_MIN_MASS = 16;
-const SPLIT_COOLDOWN = 500;
-const massToRadius = m => Math.sqrt(m) * 4;
-const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const lerp = (a, b, t) => a + (b - a) * t;
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+// ─── Mirrored physics constants ───────────────────────────────────────────────
+const WORLD        = 3000;
+const TICK_MS      = 1000 / 30;
+const MTR          = m => Math.sqrt(m) * 4;   // massToRadius
+const lerp         = (a, b, t) => a + (b - a) * t;
+const clamp        = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const vdist        = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const SPLIT_TICKS  = 20;
+const SPLIT_DECAY  = 0.80;
+const MERGE_CD     = 3000;
+const MAX_SPLIT    = 4;
+const SPLIT_MIN    = 16;
+const SPLIT_CD     = 500;
 
-// ─── State ────────────────────────────────────────────────────────────────────
+// ─── Game state ───────────────────────────────────────────────────────────────
 let myId = null, myName = '', myColor = '#7df', playing = false;
+
+// Own cells — run client-side physics on these for zero-lag feel
+let myCells    = [];   // [{ id, x, y, r, mass, vx, vy, splitTick, splitTimer }]
+let splitCD    = 0;
+let lastTick   = 0;
+
+// Snapshot buffer for everyone (used to render others + food/viruses)
+const snapBuf  = [];   // [{ time, snap }]
 let lastLeaderboard = [];
 
-// Client-side predicted cells for own player
-let predicted = null;       // { cells, splitCooldown }
-let lastPredictTime = 0;
-
-// Snapshot buffer for OTHER players (interpolated)
-const snapBuf = [];         // [ { time, snap } ]
-
-// Smooth camera
+// Camera
 const cam = { x: 1500, y: 1500, scale: 0.8 };
 
 // ─── Arrow keys ───────────────────────────────────────────────────────────────
 const keys = {};
 window.addEventListener('keydown', e => {
   keys[e.key] = true;
-  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
   if (!playing) return;
-  if (e.code === 'Space') { socket.emit('split'); clientSplit(); }
+  if (e.code === 'Space') { clientSplit(); socket.emit('split'); }
   if (e.key === 'w' || e.key === 'W') socket.emit('eject');
 });
 window.addEventListener('keyup', e => { keys[e.key] = false; });
 
-// Returns world-space direction vector (or null when idle)
-function getInputDir() {
+function inputDir() {
   let dx = 0, dy = 0;
   if (keys['ArrowRight']) dx += 1;
   if (keys['ArrowLeft'])  dx -= 1;
   if (keys['ArrowDown'])  dy += 1;
   if (keys['ArrowUp'])    dy -= 1;
-  if (dx === 0 && dy === 0) return null;
   if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
-  return { dx, dy };
-}
-
-// World-space target for sending to server
-function getServerTarget(cx, cy) {
-  const dir = getInputDir();
-  if (!dir) return { tx: cx, ty: cy }; // idle: send own position → server velocity = 0
-  return { tx: cx + dir.dx * 3000, ty: cy + dir.dy * 3000 };
+  return { dx, dy, moving: dx !== 0 || dy !== 0 };
 }
 
 // ─── Ping ─────────────────────────────────────────────────────────────────────
 let pingStart = 0;
 setInterval(() => { pingStart = Date.now(); socket.emit('ping_'); }, 2000);
-socket.on('pong_', () => { document.getElementById('ping-display').textContent = `PING: ${Date.now() - pingStart}ms`; });
+socket.on('pong_', () => {
+  document.getElementById('ping-display').textContent = `PING: ${Date.now() - pingStart}ms`;
+});
 
-// ─── Client-side prediction ───────────────────────────────────────────────────
-function makePredictedCell(sc) {
-  return { ...sc, vx: 0, vy: 0, splitTick: 999, splitTimer: sc.splitTimer || 0 };
-}
+// ─── Client physics ───────────────────────────────────────────────────────────
+function stepCells(dt) {
+  if (!myCells.length) return;
+  splitCD = Math.max(0, splitCD - dt);
+  const { dx, dy, moving } = inputDir();
 
-function initPredicted(serverCells) {
-  predicted = {
-    cells: serverCells.map(makePredictedCell),
-    splitCooldown: 0,
-  };
-  lastPredictTime = performance.now();
-}
-
-// Mirror server physics on the client at 60fps
-function tickPredicted(dt) {
-  if (!predicted) return;
-  const dtFactor = dt / TICK_MS; // scale relative to server tick
-
-  predicted.splitCooldown = Math.max(0, predicted.splitCooldown - dt);
-
-  const cx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
-  const cy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
-  const dir = getInputDir();
-
-  for (const c of predicted.cells) {
+  for (const c of myCells) {
     const speed = Math.max(1.5, 6 / Math.sqrt(c.mass / 10));
 
-    if (c.splitTick < SPLIT_MOMENTUM_TICKS) {
-      const blend = c.splitTick / SPLIT_MOMENTUM_TICKS;
-      c.vx *= SPLIT_MOMENTUM_DECAY;
-      c.vy *= SPLIT_MOMENTUM_DECAY;
-      if (dir) {
-        c.vx += dir.dx * speed * blend * 0.25;
-        c.vy += dir.dy * speed * blend * 0.25;
+    if (c.splitTick < SPLIT_TICKS) {
+      // Blend from launch momentum → steering
+      const blend = c.splitTick / SPLIT_TICKS;
+      c.vx *= SPLIT_DECAY;
+      c.vy *= SPLIT_DECAY;
+      if (moving) {
+        c.vx += dx * speed * blend * 0.3;
+        c.vy += dy * speed * blend * 0.3;
       }
       c.splitTick++;
+    } else if (moving) {
+      c.vx = dx * speed;
+      c.vy = dy * speed;
     } else {
-      if (dir) {
-        c.vx = dir.dx * speed;
-        c.vy = dir.dy * speed;
-      } else {
-        // Idle: drift to a stop
-        c.vx *= 0.7;
-        c.vy *= 0.7;
-        if (Math.abs(c.vx) < 0.05) c.vx = 0;
-        if (Math.abs(c.vy) < 0.05) c.vy = 0;
-      }
+      // Idle: smoothly stop
+      c.vx *= 0.75;
+      c.vy *= 0.75;
+      if (Math.abs(c.vx) < 0.05) c.vx = 0;
+      if (Math.abs(c.vy) < 0.05) c.vy = 0;
     }
 
-    c.x = clamp(c.x + c.vx * dtFactor, c.r, WORLD - c.r);
-    c.y = clamp(c.y + c.vy * dtFactor, c.r, WORLD - c.r);
+    const step = dt / TICK_MS;
+    c.x = clamp(c.x + c.vx * step, c.r, WORLD - c.r);
+    c.y = clamp(c.y + c.vy * step, c.r, WORLD - c.r);
     c.splitTimer += dt;
-    c.mass = Math.max(8, c.mass - 0.001 * dtFactor);
-    c.r = massToRadius(c.mass);
+    c.mass = Math.max(8, c.mass - 0.001 * step);
+    c.r = MTR(c.mass);
   }
 
-  // Separate overlapping cells
-  for (let iter = 0; iter < 3; iter++) {
-    for (let i = 0; i < predicted.cells.length; i++) {
-      for (let j = i+1; j < predicted.cells.length; j++) {
-        const a = predicted.cells[i], b = predicted.cells[j];
-        const d = dist(a, b), minD = a.r + b.r;
+  // Separate overlapping cells (3 passes)
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < myCells.length; i++) {
+      for (let j = i + 1; j < myCells.length; j++) {
+        const a = myCells[i], b = myCells[j];
+        const d = vdist(a, b), minD = a.r + b.r;
         if (d < minD) {
           const ang = Math.atan2(b.y - a.y, b.x - a.x) || 0;
           const push = (minD - d) * 0.5;
-          b.x += Math.cos(ang)*push; b.y += Math.sin(ang)*push;
-          a.x -= Math.cos(ang)*push; a.y -= Math.sin(ang)*push;
+          b.x += Math.cos(ang) * push; b.y += Math.sin(ang) * push;
+          a.x -= Math.cos(ang) * push; a.y -= Math.sin(ang) * push;
         }
       }
     }
   }
 
-  // Merge cells
-  if (predicted.cells.length > 1) {
-    for (let i = predicted.cells.length - 1; i > 0; i--) {
-      const c = predicted.cells[i];
-      if (c.splitTimer > MERGE_COOLDOWN && dist(predicted.cells[0], c) < predicted.cells[0].r) {
-        predicted.cells[0].mass += c.mass;
-        predicted.cells[0].r = massToRadius(predicted.cells[0].mass);
-        predicted.cells.splice(i, 1);
+  // Merge
+  if (myCells.length > 1) {
+    for (let i = myCells.length - 1; i > 0; i--) {
+      const c = myCells[i];
+      if (c.splitTimer > MERGE_CD && vdist(myCells[0], c) < myCells[0].r) {
+        myCells[0].mass += c.mass;
+        myCells[0].r = MTR(myCells[0].mass);
+        myCells.splice(i, 1);
       }
     }
   }
 }
 
-// Immediately simulate split on client (before server confirms)
+// Client-side split — immediately fires before server confirms
 function clientSplit() {
-  if (!predicted || predicted.splitCooldown > 0) return;
-  const cx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
-  const cy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
-  const dir = getInputDir() || { dx: 0, dy: -1 }; // default: split up if no key held
-
+  if (splitCD > 0 || !myCells.length) return;
+  const { dx, dy, moving } = inputDir();
+  // Default direction: up if no key held
+  const sdx = moving ? dx : 0, sdy = moving ? dy : -1;
   let didSplit = false;
-  for (const c of [...predicted.cells]) {
-    if (predicted.cells.length >= MAX_SPLIT) break;
-    if (c.mass < SPLIT_MIN_MASS) continue;
+  for (const c of [...myCells]) {
+    if (myCells.length >= MAX_SPLIT) break;
+    if (c.mass < SPLIT_MIN) continue;
     const half = c.mass / 2;
-    c.mass = half; c.r = massToRadius(half);
+    c.mass = half; c.r = MTR(half);
     const spd = Math.max(14, 22 / Math.sqrt(half / 10));
-    const nc = {
-      id: `local_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-      x: c.x + dir.dx * c.r * 2.2,
-      y: c.y + dir.dy * c.r * 2.2,
-      mass: half, r: massToRadius(half),
-      vx: dir.dx * spd, vy: dir.dy * spd,
+    myCells.push({
+      id: 'tmp_' + Math.random().toString(36).slice(2),
+      x: c.x + sdx * c.r * 2.2, y: c.y + sdy * c.r * 2.2,
+      mass: half, r: MTR(half),
+      vx: sdx * spd, vy: sdy * spd,
       splitTick: 0, splitTimer: 0,
-    };
-    predicted.cells.push(nc);
+    });
     didSplit = true;
   }
-  if (didSplit) predicted.splitCooldown = SPLIT_COOLDOWN;
+  if (didSplit) splitCD = SPLIT_CD;
 }
 
-// Reconcile predicted state with authoritative server state
+// ─── Server reconciliation ────────────────────────────────────────────────────
+// On each server snapshot, we soft-correct own cells toward server truth.
+// This keeps client prediction honest without snapping.
 function reconcile(serverCells) {
-  if (!predicted) { initPredicted(serverCells); return; }
+  // First time or respawn: just use server state directly
+  if (myCells.length === 0) {
+    myCells = serverCells.map(sc => ({ ...sc, vx: 0, vy: 0, splitTick: 999, splitTimer: sc.splitTimer || 0 }));
+    return;
+  }
 
-  const serverIds = new Set(serverCells.map(c => c.id));
+  // Match server cells to client cells by ID
+  const serverById = new Map(serverCells.map(c => [c.id, c]));
+  const clientById = new Map(myCells.filter(c => !c.id.startsWith('tmp_')).map(c => [c.id, c]));
 
-  // Add genuinely new server cells (e.g. after respawn, or first tick after split)
+  // Add new server cells we don't have yet (real splits confirmed by server)
   for (const sc of serverCells) {
-    const exists = predicted.cells.some(pc => pc.id === sc.id);
-    if (!exists) {
-      // Find a nearby local cell to replace (local split got confirmed by server)
-      const localIdx = predicted.cells.findIndex(pc =>
-        pc.id.startsWith('local_') && dist(pc, sc) < sc.r * 3
-      );
-      if (localIdx >= 0) {
-        // Swap local temp cell for real server id, keep predicted position/velocity
-        const lc = predicted.cells[localIdx];
-        lc.id = sc.id;
-        lc.mass = sc.mass; lc.r = sc.r;
+    if (!clientById.has(sc.id)) {
+      // Try to promote a tmp cell that's close to this server cell
+      const tmpIdx = myCells.findIndex(c => c.id.startsWith('tmp_') && vdist(c, sc) < sc.r * 4);
+      if (tmpIdx >= 0) {
+        myCells[tmpIdx].id = sc.id;   // Promote tmp → real
       } else {
-        predicted.cells.push(makePredictedCell(sc));
+        myCells.push({ ...sc, vx: 0, vy: 0, splitTick: 999, splitTimer: sc.splitTimer || 0 });
       }
     }
   }
 
-  // Remove stale local cells and cells the server no longer has
-  predicted.cells = predicted.cells.filter(pc =>
-    pc.id.startsWith('local_') || serverIds.has(pc.id)
-  );
+  // Remove cells server no longer has (eaten, merged)
+  myCells = myCells.filter(c => c.id.startsWith('tmp_') || serverById.has(c.id));
 
-  // Reconcile matching cells: blend toward server position if drifted
+  // Soft-correct position of each matched cell toward server
   for (const sc of serverCells) {
-    const pc = predicted.cells.find(c => c.id === sc.id);
-    if (!pc) continue;
-    const d = dist(pc, sc);
-    if (d > 300) {
-      // Way off — hard snap
-      pc.x = sc.x; pc.y = sc.y;
-    } else if (d > 8) {
-      // Soft correction — pull toward server
-      pc.x = lerp(pc.x, sc.x, 0.15);
-      pc.y = lerp(pc.y, sc.y, 0.15);
+    const cc = myCells.find(c => c.id === sc.id);
+    if (!cc) continue;
+    const d = vdist(cc, sc);
+    if (d > 250) {
+      // Hard snap if way off (e.g. respawn)
+      cc.x = sc.x; cc.y = sc.y;
+    } else if (d > 5) {
+      cc.x = lerp(cc.x, sc.x, 0.12);
+      cc.y = lerp(cc.y, sc.y, 0.12);
     }
-    // Always trust server for mass
-    pc.mass = sc.mass; pc.r = sc.r;
+    // Always trust server mass
+    cc.mass = sc.mass; cc.r = sc.r;
   }
 }
 
-// ─── Socket events ────────────────────────────────────────────────────────────
+// ─── Socket ───────────────────────────────────────────────────────────────────
 socket.on('joined', ({ id, color }) => { myId = id; myColor = color; });
 
 socket.on('state', snap => {
-  // Reconcile own player
   const me = snap.players.find(p => p.isYou);
   if (me) reconcile(me.cells);
 
-  // Buffer snapshot for interpolating other players
   snapBuf.push({ time: Date.now(), snap });
-  if (snapBuf.length > 15) snapBuf.shift();
-
-  // Always use latest leaderboard
+  if (snapBuf.length > 20) snapBuf.shift();
   if (snap.leaderboard) lastLeaderboard = snap.leaderboard;
 });
 
 socket.on('dead', ({ killer }) => {
   playing = false;
-  const mass = predicted ? Math.floor(predicted.cells.reduce((s,c) => s+c.mass, 0)) : 0;
-  predicted = null;
+  const mass = Math.floor(myCells.reduce((s, c) => s + c.mass, 0));
+  myCells = [];
   showDeathScreen(killer, mass);
 });
 
-// ─── Send input every frame ───────────────────────────────────────────────────
+// Send input every frame — world-space target far in the arrow direction
 function sendInput() {
-  if (!playing || !predicted || !predicted.cells.length) return;
-  const cx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
-  const cy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
-  const { tx, ty } = getServerTarget(cx, cy);
+  if (!playing || !myCells.length) return;
+  const cx = myCells.reduce((s, c) => s + c.x, 0) / myCells.length;
+  const cy = myCells.reduce((s, c) => s + c.y, 0) / myCells.length;
+  const { dx, dy, moving } = inputDir();
+  // When idle, send far away in current facing — server keeps last velocity direction
+  // but at near-zero speed since target is very far (dx,dy = 0 → tx=cx, server zeroes vel)
+  const tx = moving ? cx + dx * 3000 : cx;
+  const ty = moving ? cy + dy * 3000 : cy;
   socket.emit('input', { tx, ty });
 }
 
-// ─── Other-player interpolation ───────────────────────────────────────────────
+// ─── Interpolation for OTHER players ─────────────────────────────────────────
 function getOthersFrame() {
-  if (snapBuf.length < 2) return snapBuf.length ? snapBuf[snapBuf.length-1].snap : null;
-  const renderTime = Date.now() - RENDER_DELAY;
+  if (!snapBuf.length) return null;
+  // 300ms render delay — always enough to have two frames to interpolate
+  const rt = Date.now() - 300;
 
   let before = null, after = null;
-  for (let i = 0; i < snapBuf.length; i++) {
-    if (snapBuf[i].time <= renderTime) before = snapBuf[i];
-    else { after = snapBuf[i]; break; }
+  for (const s of snapBuf) {
+    if (s.time <= rt) before = s;
+    else if (!after) after = s;
   }
-
   if (!before) return snapBuf[0].snap;
-  if (!after)  return snapBuf[snapBuf.length-1].snap;
+  if (!after)  return snapBuf[snapBuf.length - 1].snap;
 
-  const t = Math.min(1, (renderTime - before.time) / (after.time - before.time));
+  const t = clamp((rt - before.time) / (after.time - before.time), 0, 1);
   const a = before.snap, b = after.snap;
 
-  const mapA = new Map();
+  const aMap = new Map();
   for (const p of a.players) {
     const cm = new Map(); for (const c of p.cells) cm.set(c.id, c);
-    mapA.set(p.id, cm);
+    aMap.set(p.id, cm);
   }
 
-  const players = b.players
-    .filter(p => !p.isYou)
-    .map(pb => {
-      const cellsA = mapA.get(pb.id);
+  return {
+    ...b,
+    players: b.players.filter(p => !p.isYou).map(pb => {
+      const acm = aMap.get(pb.id);
       return { ...pb, cells: pb.cells.map(cb => {
-        const ca = cellsA?.get(cb.id);
+        const ca = acm?.get(cb.id);
         if (!ca) return cb;
         return { ...cb, x: lerp(ca.x, cb.x, t), y: lerp(ca.y, cb.y, t), r: lerp(ca.r, cb.r, t) };
       })};
-    });
-
-  return { ...b, players, food: b.food, viruses: b.viruses };
+    }),
+  };
 }
 
-// ─── Draw helpers ─────────────────────────────────────────────────────────────
-function adjustColor(col, amt) {
+// ─── Draw ─────────────────────────────────────────────────────────────────────
+function adjColor(col, amt) {
   if (!col.startsWith('#')) return col;
-  let s = col.slice(1);
-  if (s.length === 3) s = s.split('').map(c => c+c).join('');
-  const r = clamp(parseInt(s.slice(0,2),16)+amt, 0, 255);
-  const g = clamp(parseInt(s.slice(2,4),16)+amt, 0, 255);
-  const b = clamp(parseInt(s.slice(4,6),16)+amt, 0, 255);
-  return `rgb(${r},${g},${b})`;
+  let s = col.slice(1); if (s.length===3) s = s.split('').map(c=>c+c).join('');
+  return `rgb(${clamp(parseInt(s.slice(0,2),16)+amt,0,255)},${clamp(parseInt(s.slice(2,4),16)+amt,0,255)},${clamp(parseInt(s.slice(4,6),16)+amt,0,255)})`;
 }
 
-function drawCell(x, y, r, color, name, isYou) {
+function drawCircle(x, y, r, color, label, isYou) {
   const sx = (x - cam.x)*cam.scale + canvas.width/2;
   const sy = (y - cam.y)*cam.scale + canvas.height/2;
   const sr = r * cam.scale;
-  if (sx+sr < 0 || sx-sr > canvas.width || sy+sr < 0 || sy-sr > canvas.height) return;
-  const g = ctx.createRadialGradient(sx-sr*0.3, sy-sr*0.3, sr*0.05, sx, sy, sr);
-  g.addColorStop(0, adjustColor(color, 50));
-  g.addColorStop(0.6, color);
-  g.addColorStop(1, adjustColor(color, -30));
-  ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI*2);
+  if (sx+sr<0||sx-sr>canvas.width||sy+sr<0||sy-sr>canvas.height) return;
+  const g = ctx.createRadialGradient(sx-sr*0.3,sy-sr*0.3,sr*0.05,sx,sy,sr);
+  g.addColorStop(0, adjColor(color,50)); g.addColorStop(0.6,color); g.addColorStop(1,adjColor(color,-30));
+  ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2);
   ctx.fillStyle = g; ctx.fill();
-  ctx.strokeStyle = isYou ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.25)';
-  ctx.lineWidth = isYou ? Math.max(2, sr*0.05) : Math.max(1, sr*0.04);
-  ctx.stroke();
-  if (sr > 14) {
-    ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.font = `bold ${Math.min(sr*0.45,20)}px Rajdhani,sans-serif`;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(name, sx, sy);
+  ctx.strokeStyle = isYou?'rgba(255,255,255,0.5)':'rgba(0,0,0,0.25)';
+  ctx.lineWidth = isYou?Math.max(2,sr*0.05):Math.max(1,sr*0.04); ctx.stroke();
+  if (sr>14) {
+    ctx.fillStyle='rgba(255,255,255,0.9)';
+    ctx.font=`bold ${Math.min(sr*0.45,20)}px Rajdhani,sans-serif`;
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(label,sx,sy);
   }
 }
 
 function drawGrid() {
-  const gs = 40 * cam.scale;
-  const ox = (-cam.x*cam.scale + canvas.width/2) % gs;
-  const oy = (-cam.y*cam.scale + canvas.height/2) % gs;
-  ctx.strokeStyle = 'rgba(255,255,255,0.04)'; ctx.lineWidth = 1;
-  ctx.beginPath();
-  for (let x = ox; x < canvas.width; x += gs) { ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); }
-  for (let y = oy; y < canvas.height; y += gs) { ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); }
+  const gs=40*cam.scale, ox=(-cam.x*cam.scale+canvas.width/2)%gs, oy=(-cam.y*cam.scale+canvas.height/2)%gs;
+  ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineWidth=1; ctx.beginPath();
+  for(let x=ox;x<canvas.width;x+=gs){ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);}
+  for(let y=oy;y<canvas.height;y+=gs){ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);}
   ctx.stroke();
 }
 
 function drawBorder() {
-  ctx.strokeStyle = 'rgba(100,200,255,0.25)'; ctx.lineWidth = 2;
-  ctx.strokeRect((0-cam.x)*cam.scale+canvas.width/2, (0-cam.y)*cam.scale+canvas.height/2, WORLD*cam.scale, WORLD*cam.scale);
+  ctx.strokeStyle='rgba(100,200,255,0.25)'; ctx.lineWidth=2;
+  ctx.strokeRect((0-cam.x)*cam.scale+canvas.width/2,(0-cam.y)*cam.scale+canvas.height/2,WORLD*cam.scale,WORLD*cam.scale);
 }
 
 function drawVirus(v) {
-  const sx = (v.x-cam.x)*cam.scale+canvas.width/2;
-  const sy = (v.y-cam.y)*cam.scale+canvas.height/2;
-  const sr = v.r*cam.scale;
-  if (sx+sr<0||sx-sr>canvas.width||sy+sr<0||sy-sr>canvas.height) return;
+  const sx=(v.x-cam.x)*cam.scale+canvas.width/2, sy=(v.y-cam.y)*cam.scale+canvas.height/2, sr=v.r*cam.scale;
+  if(sx+sr<0||sx-sr>canvas.width||sy+sr<0||sy-sr>canvas.height) return;
   ctx.beginPath();
-  for (let i = 0; i < 32; i++) {
-    const ang = (i/32)*Math.PI*2, r = i%2===0 ? sr : sr*0.75;
-    i===0 ? ctx.moveTo(sx+Math.cos(ang)*r, sy+Math.sin(ang)*r)
-           : ctx.lineTo(sx+Math.cos(ang)*r, sy+Math.sin(ang)*r);
-  }
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(50,200,100,0.4)'; ctx.fill();
-  ctx.strokeStyle = 'rgba(50,255,100,0.7)'; ctx.lineWidth = 1.5; ctx.stroke();
+  for(let i=0;i<32;i++){const ang=(i/32)*Math.PI*2,r=i%2===0?sr:sr*0.75; i===0?ctx.moveTo(sx+Math.cos(ang)*r,sy+Math.sin(ang)*r):ctx.lineTo(sx+Math.cos(ang)*r,sy+Math.sin(ang)*r);}
+  ctx.closePath(); ctx.fillStyle='rgba(50,200,100,0.4)'; ctx.fill();
+  ctx.strokeStyle='rgba(50,255,100,0.7)'; ctx.lineWidth=1.5; ctx.stroke();
 }
 
 // ─── Render loop ──────────────────────────────────────────────────────────────
-let lastRAF = 0;
+let lastNow = 0;
 function loop(now) {
   requestAnimationFrame(loop);
-  const dt = Math.min(now - lastRAF, 50); // cap at 50ms
-  lastRAF = now;
-
+  const dt = Math.min(now - lastNow, 50); lastNow = now;
   sendInput();
 
-  ctx.fillStyle = '#0a0a0f';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle='#0a0a0f'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  if (!playing || !myCells.length) return;
 
-  if (!playing) return;
+  stepCells(dt);
 
-  // Tick client prediction
-  tickPredicted(dt);
+  // Camera
+  const cx = myCells.reduce((s,c)=>s+c.x,0)/myCells.length;
+  const cy = myCells.reduce((s,c)=>s+c.y,0)/myCells.length;
+  const myMass = myCells.reduce((s,c)=>s+c.mass,0);
+  let minX=cx,maxX=cx,minY=cy,maxY=cy;
+  for(const c of myCells){minX=Math.min(minX,c.x-c.r);maxX=Math.max(maxX,c.x+c.r);minY=Math.min(minY,c.y-c.r);maxY=Math.max(maxY,c.y+c.r);}
+  const sByMass   = 64/(Math.sqrt(myMass)*4+10);
+  const sBySpread = Math.min((canvas.width*0.7)/Math.max(maxX-minX,1),(canvas.height*0.7)/Math.max(maxY-minY,1));
+  const tScale    = clamp(Math.min(sByMass,sBySpread),0.15,1.2);
+  cam.x = lerp(cam.x,cx,0.1); cam.y = lerp(cam.y,cy,0.1); cam.scale = lerp(cam.scale,tScale,0.06);
 
-  if (!predicted || !predicted.cells.length) return;
+  drawGrid(); drawBorder();
 
-  // Camera target: centroid of predicted cells
-  const pcx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
-  const pcy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
-  const myMass = predicted.cells.reduce((s,c) => s+c.mass, 0);
-
-  // Zoom to fit all own cells
-  let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
-  for (const c of predicted.cells) {
-    minX=Math.min(minX,c.x-c.r); maxX=Math.max(maxX,c.x+c.r);
-    minY=Math.min(minY,c.y-c.r); maxY=Math.max(maxY,c.y+c.r);
-  }
-  const scaleByMass   = 64 / (Math.sqrt(myMass)*4 + 10);
-  const scaleBySpread = Math.min((canvas.width*0.7)/Math.max(maxX-minX,1), (canvas.height*0.7)/Math.max(maxY-minY,1));
-  const targetScale   = clamp(Math.min(scaleByMass, scaleBySpread), 0.15, 1.2);
-
-  cam.x     = lerp(cam.x, pcx, 0.1);
-  cam.y     = lerp(cam.y, pcy, 0.1);
-  cam.scale = lerp(cam.scale, targetScale, 0.06);
-
-  drawGrid();
-  drawBorder();
-
-  // Get other players from interpolated server buffer
   const frame = getOthersFrame();
-
-  // Food & viruses from server (no need to predict these)
   if (frame) {
-    for (const f of frame.food) {
-      const sx=(f.x-cam.x)*cam.scale+canvas.width/2, sy=(f.y-cam.y)*cam.scale+canvas.height/2;
-      const sr=Math.max(1.5,f.r*cam.scale);
-      ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2); ctx.fillStyle=f.color; ctx.fill();
-    }
-    for (const v of frame.viruses) drawVirus(v);
-    // Draw other players (interpolated)
-    for (const p of frame.players)
-      for (const c of p.cells) drawCell(c.x, c.y, c.r, p.color, p.name, false);
+    for(const f of frame.food){const sx=(f.x-cam.x)*cam.scale+canvas.width/2,sy=(f.y-cam.y)*cam.scale+canvas.height/2,sr=Math.max(1.5,f.r*cam.scale);ctx.beginPath();ctx.arc(sx,sy,sr,0,Math.PI*2);ctx.fillStyle=f.color;ctx.fill();}
+    for(const v of frame.viruses) drawVirus(v);
+    for(const p of frame.players) for(const c of p.cells) drawCircle(c.x,c.y,c.r,p.color,p.name,false);
   }
 
-  // Draw own cells from CLIENT PREDICTION (zero-latency)
-  for (const c of predicted.cells) drawCell(c.x, c.y, c.r, myColor, myName, true);
+  // Own cells from prediction — always on top
+  for(const c of myCells) drawCircle(c.x,c.y,c.r,myColor,myName,true);
 
-  // HUD
   document.getElementById('mass-val').textContent = Math.floor(myMass);
   document.getElementById('leaderboard-list').innerHTML = lastLeaderboard
-    .map((e,i) => `<li class="${e.isYou?'you':''}"><span>#${i+1}</span>${e.name}<span>${e.mass}</span></li>`)
+    .map((e,i)=>`<li class="${e.isYou?'you':''}"><span>#${i+1}</span>${e.name}<span>${e.mass}</span></li>`)
     .join('');
 }
 requestAnimationFrame(loop);
+
+// ─── Cheat code ───────────────────────────────────────────────────────────────
+window.setMass = (mass) => {
+  if (!playing || !myCells.length) { console.log('Not in game'); return; }
+  const r = MTR(mass);
+  myCells = [{ ...myCells[0], mass, r, vx:0, vy:0, splitTick:999, splitTimer:0 }];
+  socket.emit('cheat_mass', { mass });
+  console.log(`%cMass set to ${mass}`, 'color:#7df;font-weight:bold;font-size:16px');
+};
+console.log('%cCheat code available: setMass(1000)', 'color:#f7d;font-size:13px;');
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
 function startGame() {
   myName = document.getElementById('name-input').value.trim() || 'Player';
   socket.emit('join', { name: myName });
-  playing = true;
+  myCells = []; playing = true;
   document.getElementById('overlay').style.display = 'none';
 }
 
@@ -526,19 +460,17 @@ function showDeathScreen(killer, mass) {
   `;
   ov.style.display = 'flex';
   document.getElementById('play-btn').onclick = respawn;
-  document.getElementById('name-input').onkeydown = e => { if (e.key==='Enter') respawn(); };
+  document.getElementById('name-input').onkeydown = e => { if(e.key==='Enter') respawn(); };
 }
 
 function respawn() {
   myName = document.getElementById('name-input').value.trim() || myName;
-  socket.emit('respawn', { name: myName });
-  playing = true;
-  predicted = null;
-  document.getElementById('overlay').style.display = 'none';
+  myCells = []; socket.emit('respawn', { name: myName });
+  playing = true; document.getElementById('overlay').style.display = 'none';
 }
 
 document.getElementById('play-btn').addEventListener('click', startGame);
-document.getElementById('name-input').addEventListener('keydown', e => { if (e.key==='Enter') startGame(); });
+document.getElementById('name-input').addEventListener('keydown', e => { if(e.key==='Enter') startGame(); });
 </script>
 </body>
 </html>
