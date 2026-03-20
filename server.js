@@ -33,7 +33,7 @@ const randInt = (a, b) => Math.floor(rand(a, b));
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const massToRadius = m => Math.sqrt(m) * 4;
 let nextId = 1;
-const uid = () => nextId++;
+const uid = () => String(nextId++);
 
 const state = { players: new Map(), food: [], viruses: [] };
 
