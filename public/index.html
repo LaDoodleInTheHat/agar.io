@@ -65,7 +65,7 @@
 <canvas id="c"></canvas>
 <div id="score-display">MASS: <span id="mass-val">—</span></div>
 <div id="leaderboard"><h3>LEADERBOARD</h3><ul id="leaderboard-list"></ul></div>
-<div id="hint">MOVE: mouse &nbsp;|&nbsp; SPLIT: space &nbsp;|&nbsp; EJECT: W</div>
+<div id="hint">MOVE: arrow keys &nbsp;|&nbsp; SPLIT: space &nbsp;|&nbsp; EJECT: W</div>
 <div id="ping-display">PING: —ms</div>
 
 <div id="overlay">
@@ -78,7 +78,7 @@
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-// ─── Canvas setup ─────────────────────────────────────────────────────────────
+// ─── Canvas ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
@@ -92,11 +92,43 @@ const socket = io();
 let myId = null;
 let myName = '';
 let playing = false;
-let gameState = null;          // latest server snapshot
-const cam = { x: 1500, y: 1500, scale: 0.8 };
-const mouse = { sx: window.innerWidth / 2, sy: window.innerHeight / 2 };
 
-canvas.addEventListener('mousemove', e => { mouse.sx = e.clientX; mouse.sy = e.clientY; });
+// Two most recent server snapshots for interpolation
+let snapA = null, snapB = null;
+let snapATime = 0, snapBTime = 0;
+const SERVER_HZ = 30;
+const SERVER_TICK_MS = 1000 / SERVER_HZ;
+
+// Smooth camera
+const cam = { x: 1500, y: 1500, scale: 0.8 };
+
+// ─── Arrow key input ──────────────────────────────────────────────────────────
+const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
+
+window.addEventListener('keydown', e => {
+  if (e.key in keys) { e.preventDefault(); keys[e.key] = true; }
+  if (!playing) return;
+  if (e.code === 'Space') { e.preventDefault(); socket.emit('split'); }
+  if (e.key === 'w' || e.key === 'W') socket.emit('eject');
+});
+window.addEventListener('keyup', e => { if (e.key in keys) keys[e.key] = false; });
+
+// Compute world-space target from arrow keys + camera
+function getArrowTarget() {
+  let dx = 0, dy = 0;
+  if (keys.ArrowRight) dx += 1;
+  if (keys.ArrowLeft)  dx -= 1;
+  if (keys.ArrowDown)  dy += 1;
+  if (keys.ArrowUp)    dy -= 1;
+  // Normalize diagonal
+  if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+  // Project far out from camera center in that direction
+  return {
+    tx: cam.x + dx * 2000,
+    ty: cam.y + dy * 2000,
+    moving: dx !== 0 || dy !== 0,
+  };
+}
 
 // ─── Ping ─────────────────────────────────────────────────────────────────────
 let pingStart = 0;
@@ -108,31 +140,67 @@ socket.on('pong_', () => {
 // ─── Socket events ────────────────────────────────────────────────────────────
 socket.on('joined', ({ id }) => { myId = id; });
 
-socket.on('state', snap => { gameState = snap; });
+socket.on('state', snap => {
+  snapA = snapB;
+  snapATime = snapBTime;
+  snapB = snap;
+  snapBTime = Date.now();
+});
 
 socket.on('dead', ({ killer }) => {
   playing = false;
-  const me = gameState?.players.find(p => p.isYou);
-  const mass = me ? Math.floor(me.cells.reduce((s,c) => s+c.mass, 0)) : 0;
+  // Get last known mass from interpolated state
+  const last = snapB?.players?.find(p => p.isYou);
+  const mass = last ? Math.floor(last.cells.reduce((s,c) => s+c.mass, 0)) : 0;
   showDeathScreen(killer, mass);
 });
 
-// ─── Input ────────────────────────────────────────────────────────────────────
+// ─── Send input at 60fps ──────────────────────────────────────────────────────
+// We always send the current target so the server stays up to date
 function sendInput() {
-  if (!playing || !gameState) return;
-  // Convert screen mouse → world coords
-  const tx = (mouse.sx - canvas.width/2) / cam.scale + cam.x;
-  const ty = (mouse.sy - canvas.height/2) / cam.scale + cam.y;
+  if (!playing) return;
+  const { tx, ty } = getArrowTarget();
   socket.emit('input', { tx, ty });
 }
 
-window.addEventListener('keydown', e => {
-  if (!playing) return;
-  if (e.code === 'Space') { e.preventDefault(); socket.emit('split'); }
-  if (e.key === 'w' || e.key === 'W') socket.emit('eject');
-});
+// ─── Interpolation helpers ────────────────────────────────────────────────────
+function lerp(a, b, t) { return a + (b - a) * t; }
 
-// ─── Drawing helpers ──────────────────────────────────────────────────────────
+// Interpolate between two snapshots. t = 0 → snapA, t = 1 → snapB
+function interpolateSnap(t) {
+  if (!snapB) return null;
+  if (!snapA) return snapB;   // no previous — just use latest
+
+  const result = { leaderboard: snapB.leaderboard, food: snapB.food, viruses: snapB.viruses, players: [] };
+
+  // Build lookup maps for fast matching
+  const mapA = new Map();
+  for (const p of snapA.players) {
+    const cellMap = new Map();
+    for (const c of p.cells) cellMap.set(c.id, c);
+    mapA.set(p.id, { ...p, cellMap });
+  }
+
+  for (const pb of snapB.players) {
+    const pa = mapA.get(pb.id);
+    const cells = pb.cells.map(cb => {
+      if (!pa) return cb;
+      const ca = pa.cellMap.get(cb.id);
+      if (!ca) return cb;
+      return {
+        ...cb,
+        x: lerp(ca.x, cb.x, t),
+        y: lerp(ca.y, cb.y, t),
+        r: lerp(ca.r, cb.r, t),
+      };
+    });
+    result.players.push({ ...pb, cells });
+  }
+
+  return result;
+}
+
+// ─── Draw helpers ─────────────────────────────────────────────────────────────
 function adjustColor(col, amt) {
   if (!col.startsWith('#')) return col;
   let s = col.slice(1);
@@ -154,12 +222,12 @@ function drawCell(c, cx, cy, scale, color, name, isYou) {
   grad.addColorStop(1, adjustColor(color, -30));
   ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI*2);
   ctx.fillStyle = grad; ctx.fill();
-  ctx.strokeStyle = isYou ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.25)';
-  ctx.lineWidth = isYou ? Math.max(1.5, sr*0.05) : Math.max(1, sr*0.04);
+  ctx.strokeStyle = isYou ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.25)';
+  ctx.lineWidth = isYou ? Math.max(2, sr*0.05) : Math.max(1, sr*0.04);
   ctx.stroke();
   if (sr > 14) {
     ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.font = `bold ${Math.min(sr*0.45,20)}px Rajdhani,sans-serif`;
+    ctx.font = `bold ${Math.min(sr*0.45, 20)}px Rajdhani,sans-serif`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(name, sx, sy);
   }
@@ -198,9 +266,7 @@ function drawVirus(v, cx, cy, scale) {
   ctx.strokeStyle = 'rgba(50,255,100,0.7)'; ctx.lineWidth = 1.5; ctx.stroke();
 }
 
-// ─── Main render loop ─────────────────────────────────────────────────────────
-function lerp(a, b, t) { return a + (b-a)*t; }
-
+// ─── Main render loop (60fps) ─────────────────────────────────────────────────
 function loop() {
   requestAnimationFrame(loop);
   sendInput();
@@ -208,25 +274,34 @@ function loop() {
   ctx.fillStyle = '#0a0a0f';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  if (!playing || !gameState) return;
+  if (!playing || !snapB) return;
 
-  const me = gameState.players.find(p => p.isYou);
+  // Interpolation factor: how far between snapA and snapB we are right now
+  const now = Date.now();
+  const elapsed = now - snapBTime;
+  // We render slightly behind to always have two snapshots to interpolate between
+  const t = Math.min(1, elapsed / SERVER_TICK_MS);
+
+  const frame = interpolateSnap(t);
+  if (!frame) return;
+
+  const me = frame.players.find(p => p.isYou);
   if (!me || !me.cells.length) return;
 
   // Smooth camera toward player centroid
-  const tcx = me.cells.reduce((s,c)=>s+c.x,0)/me.cells.length;
-  const tcy = me.cells.reduce((s,c)=>s+c.y,0)/me.cells.length;
-  const myMass = me.cells.reduce((s,c)=>s+c.mass,0);
-  const targetScale = Math.min(1.2, Math.max(0.2, 64/(Math.sqrt(myMass)*4+10)));
-  cam.x = lerp(cam.x, tcx, 0.1);
-  cam.y = lerp(cam.y, tcy, 0.1);
-  cam.scale = lerp(cam.scale, targetScale, 0.05);
+  const tcx = me.cells.reduce((s,c) => s+c.x, 0) / me.cells.length;
+  const tcy = me.cells.reduce((s,c) => s+c.y, 0) / me.cells.length;
+  const myMass = me.cells.reduce((s,c) => s+c.mass, 0);
+  const targetScale = Math.min(1.2, Math.max(0.2, 64 / (Math.sqrt(myMass)*4 + 10)));
+  cam.x = lerp(cam.x, tcx, 0.12);
+  cam.y = lerp(cam.y, tcy, 0.12);
+  cam.scale = lerp(cam.scale, targetScale, 0.06);
 
   drawGrid(cam.x, cam.y, cam.scale);
   drawBorder(cam.x, cam.y, cam.scale);
 
   // Food
-  for (const f of gameState.food) {
+  for (const f of frame.food) {
     const sx = (f.x-cam.x)*cam.scale+canvas.width/2;
     const sy = (f.y-cam.y)*cam.scale+canvas.height/2;
     const sr = Math.max(1.5, f.r*cam.scale);
@@ -235,18 +310,35 @@ function loop() {
   }
 
   // Viruses
-  for (const v of gameState.viruses) drawVirus(v, cam.x, cam.y, cam.scale);
+  for (const v of frame.viruses) drawVirus(v, cam.x, cam.y, cam.scale);
 
-  // Draw other players first, then self on top
-  const sorted = [...gameState.players].sort((a,b) => a.isYou - b.isYou);
+  // Draw others first, self on top
+  const sorted = [...frame.players].sort((a,b) => a.isYou - b.isYou);
   for (const p of sorted) {
     for (const c of p.cells) drawCell(c, cam.x, cam.y, cam.scale, p.color, p.name, p.isYou);
+  }
+
+  // Draw arrow key direction indicator
+  const { tx, ty, moving } = getArrowTarget();
+  if (moving && me.cells.length) {
+    const sx = (tcx - cam.x)*cam.scale + canvas.width/2;
+    const sy = (tcy - cam.y)*cam.scale + canvas.height/2;
+    const ang = Math.atan2(ty - tcy, tx - tcx);
+    const len = 40;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + Math.cos(ang)*len, sy + Math.sin(ang)*len);
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
 
   // HUD
   document.getElementById('mass-val').textContent = Math.floor(myMass);
   const list = document.getElementById('leaderboard-list');
-  list.innerHTML = gameState.leaderboard.map((e,i) =>
+  list.innerHTML = frame.leaderboard.map((e,i) =>
     `<li class="${e.isYou?'you':''}"><span>#${i+1}</span>${e.name}<span>${e.mass}</span></li>`
   ).join('');
 }
