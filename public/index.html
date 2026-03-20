@@ -71,6 +71,7 @@
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
+// ─── Canvas ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
@@ -79,123 +80,298 @@ resize();
 
 const socket = io();
 
-// ─── Game state ───────────────────────────────────────────────────────────────
-let myId = null, myName = '', playing = false;
+// ─── Constants (mirror server) ────────────────────────────────────────────────
+const WORLD = 3000;
+const TICK_MS = 1000 / 30;
+const RENDER_DELAY = 300;          // ms behind for other-player interpolation
+const SPLIT_MOMENTUM_TICKS = 20;
+const SPLIT_MOMENTUM_DECAY = 0.80;
+const MERGE_COOLDOWN = 3000;
+const MAX_SPLIT = 4;
+const SPLIT_MIN_MASS = 16;
+const SPLIT_COOLDOWN = 500;
+const massToRadius = m => Math.sqrt(m) * 4;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-// Snapshot buffer: array of { time, snap }
-// We always render at (now - RENDER_DELAY), interpolating between the two
-// snapshots that bracket that moment.
-const TICK_MS = 1000 / 30;     // server sends at 30hz
-const RENDER_DELAY = TICK_MS * 2.5; // stay 2.5 ticks behind — always have room to interpolate
-const buf = [];
+// ─── State ────────────────────────────────────────────────────────────────────
+let myId = null, myName = '', myColor = '#7df', playing = false;
+let lastLeaderboard = [];
+
+// Client-side predicted cells for own player
+let predicted = null;       // { cells, splitCooldown }
+let lastPredictTime = 0;
+
+// Snapshot buffer for OTHER players (interpolated)
+const snapBuf = [];         // [ { time, snap } ]
 
 // Smooth camera
 const cam = { x: 1500, y: 1500, scale: 0.8 };
 
-// Arrow keys
+// ─── Arrow keys ───────────────────────────────────────────────────────────────
 const keys = {};
 window.addEventListener('keydown', e => {
   keys[e.key] = true;
   if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
   if (!playing) return;
-  if (e.code === 'Space') socket.emit('split');
+  if (e.code === 'Space') { socket.emit('split'); clientSplit(); }
   if (e.key === 'w' || e.key === 'W') socket.emit('eject');
 });
 window.addEventListener('keyup', e => { keys[e.key] = false; });
 
-// Compute world-space movement target from arrow keys
-// Returns a point far in the desired direction from the player center
-function arrowTarget(playerCx, playerCy) {
+// Returns world-space direction vector (or null when idle)
+function getInputDir() {
   let dx = 0, dy = 0;
   if (keys['ArrowRight']) dx += 1;
   if (keys['ArrowLeft'])  dx -= 1;
   if (keys['ArrowDown'])  dy += 1;
   if (keys['ArrowUp'])    dy -= 1;
+  if (dx === 0 && dy === 0) return null;
   if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
-  return { tx: playerCx + dx * 3000, ty: playerCy + dy * 3000 };
+  return { dx, dy };
 }
 
-// ─── Socket events ────────────────────────────────────────────────────────────
-socket.on('joined', ({ id }) => { myId = id; });
-
-socket.on('state', snap => {
-  buf.push({ time: Date.now(), snap });
-  // Keep only last 10 snapshots
-  if (buf.length > 10) buf.shift();
-});
-
-socket.on('dead', ({ killer }) => {
-  playing = false;
-  const last = buf.length ? buf[buf.length-1].snap.players.find(p => p.isYou) : null;
-  const mass = last ? Math.floor(last.cells.reduce((s,c) => s+c.mass, 0)) : 0;
-  showDeathScreen(killer, mass);
-});
-
-// ─── Send input every frame ───────────────────────────────────────────────────
-// Use the last known player position so direction is stable
-let lastPlayerCx = 1500, lastPlayerCy = 1500;
-
-function sendInput() {
-  if (!playing) return;
-  const { tx, ty } = arrowTarget(lastPlayerCx, lastPlayerCy);
-  socket.emit('input', { tx, ty });
+// World-space target for sending to server
+function getServerTarget(cx, cy) {
+  const dir = getInputDir();
+  if (!dir) return { tx: cx, ty: cy }; // idle: send own position → server velocity = 0
+  return { tx: cx + dir.dx * 3000, ty: cy + dir.dy * 3000 };
 }
 
 // ─── Ping ─────────────────────────────────────────────────────────────────────
 let pingStart = 0;
 setInterval(() => { pingStart = Date.now(); socket.emit('ping_'); }, 2000);
-socket.on('pong_', () => {
-  document.getElementById('ping-display').textContent = `PING: ${Date.now() - pingStart}ms`;
+socket.on('pong_', () => { document.getElementById('ping-display').textContent = `PING: ${Date.now() - pingStart}ms`; });
+
+// ─── Client-side prediction ───────────────────────────────────────────────────
+function makePredictedCell(sc) {
+  return { ...sc, vx: 0, vy: 0, splitTick: 999, splitTimer: sc.splitTimer || 0 };
+}
+
+function initPredicted(serverCells) {
+  predicted = {
+    cells: serverCells.map(makePredictedCell),
+    splitCooldown: 0,
+  };
+  lastPredictTime = performance.now();
+}
+
+// Mirror server physics on the client at 60fps
+function tickPredicted(dt) {
+  if (!predicted) return;
+  const dtFactor = dt / TICK_MS; // scale relative to server tick
+
+  predicted.splitCooldown = Math.max(0, predicted.splitCooldown - dt);
+
+  const cx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
+  const cy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
+  const dir = getInputDir();
+
+  for (const c of predicted.cells) {
+    const speed = Math.max(1.5, 6 / Math.sqrt(c.mass / 10));
+
+    if (c.splitTick < SPLIT_MOMENTUM_TICKS) {
+      const blend = c.splitTick / SPLIT_MOMENTUM_TICKS;
+      c.vx *= SPLIT_MOMENTUM_DECAY;
+      c.vy *= SPLIT_MOMENTUM_DECAY;
+      if (dir) {
+        c.vx += dir.dx * speed * blend * 0.25;
+        c.vy += dir.dy * speed * blend * 0.25;
+      }
+      c.splitTick++;
+    } else {
+      if (dir) {
+        c.vx = dir.dx * speed;
+        c.vy = dir.dy * speed;
+      } else {
+        // Idle: drift to a stop
+        c.vx *= 0.7;
+        c.vy *= 0.7;
+        if (Math.abs(c.vx) < 0.05) c.vx = 0;
+        if (Math.abs(c.vy) < 0.05) c.vy = 0;
+      }
+    }
+
+    c.x = clamp(c.x + c.vx * dtFactor, c.r, WORLD - c.r);
+    c.y = clamp(c.y + c.vy * dtFactor, c.r, WORLD - c.r);
+    c.splitTimer += dt;
+    c.mass = Math.max(8, c.mass - 0.001 * dtFactor);
+    c.r = massToRadius(c.mass);
+  }
+
+  // Separate overlapping cells
+  for (let iter = 0; iter < 3; iter++) {
+    for (let i = 0; i < predicted.cells.length; i++) {
+      for (let j = i+1; j < predicted.cells.length; j++) {
+        const a = predicted.cells[i], b = predicted.cells[j];
+        const d = dist(a, b), minD = a.r + b.r;
+        if (d < minD) {
+          const ang = Math.atan2(b.y - a.y, b.x - a.x) || 0;
+          const push = (minD - d) * 0.5;
+          b.x += Math.cos(ang)*push; b.y += Math.sin(ang)*push;
+          a.x -= Math.cos(ang)*push; a.y -= Math.sin(ang)*push;
+        }
+      }
+    }
+  }
+
+  // Merge cells
+  if (predicted.cells.length > 1) {
+    for (let i = predicted.cells.length - 1; i > 0; i--) {
+      const c = predicted.cells[i];
+      if (c.splitTimer > MERGE_COOLDOWN && dist(predicted.cells[0], c) < predicted.cells[0].r) {
+        predicted.cells[0].mass += c.mass;
+        predicted.cells[0].r = massToRadius(predicted.cells[0].mass);
+        predicted.cells.splice(i, 1);
+      }
+    }
+  }
+}
+
+// Immediately simulate split on client (before server confirms)
+function clientSplit() {
+  if (!predicted || predicted.splitCooldown > 0) return;
+  const cx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
+  const cy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
+  const dir = getInputDir() || { dx: 0, dy: -1 }; // default: split up if no key held
+
+  let didSplit = false;
+  for (const c of [...predicted.cells]) {
+    if (predicted.cells.length >= MAX_SPLIT) break;
+    if (c.mass < SPLIT_MIN_MASS) continue;
+    const half = c.mass / 2;
+    c.mass = half; c.r = massToRadius(half);
+    const spd = Math.max(14, 22 / Math.sqrt(half / 10));
+    const nc = {
+      id: `local_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      x: c.x + dir.dx * c.r * 2.2,
+      y: c.y + dir.dy * c.r * 2.2,
+      mass: half, r: massToRadius(half),
+      vx: dir.dx * spd, vy: dir.dy * spd,
+      splitTick: 0, splitTimer: 0,
+    };
+    predicted.cells.push(nc);
+    didSplit = true;
+  }
+  if (didSplit) predicted.splitCooldown = SPLIT_COOLDOWN;
+}
+
+// Reconcile predicted state with authoritative server state
+function reconcile(serverCells) {
+  if (!predicted) { initPredicted(serverCells); return; }
+
+  const serverIds = new Set(serverCells.map(c => c.id));
+
+  // Add genuinely new server cells (e.g. after respawn, or first tick after split)
+  for (const sc of serverCells) {
+    const exists = predicted.cells.some(pc => pc.id === sc.id);
+    if (!exists) {
+      // Find a nearby local cell to replace (local split got confirmed by server)
+      const localIdx = predicted.cells.findIndex(pc =>
+        pc.id.startsWith('local_') && dist(pc, sc) < sc.r * 3
+      );
+      if (localIdx >= 0) {
+        // Swap local temp cell for real server id, keep predicted position/velocity
+        const lc = predicted.cells[localIdx];
+        lc.id = sc.id;
+        lc.mass = sc.mass; lc.r = sc.r;
+      } else {
+        predicted.cells.push(makePredictedCell(sc));
+      }
+    }
+  }
+
+  // Remove stale local cells and cells the server no longer has
+  predicted.cells = predicted.cells.filter(pc =>
+    pc.id.startsWith('local_') || serverIds.has(pc.id)
+  );
+
+  // Reconcile matching cells: blend toward server position if drifted
+  for (const sc of serverCells) {
+    const pc = predicted.cells.find(c => c.id === sc.id);
+    if (!pc) continue;
+    const d = dist(pc, sc);
+    if (d > 300) {
+      // Way off — hard snap
+      pc.x = sc.x; pc.y = sc.y;
+    } else if (d > 8) {
+      // Soft correction — pull toward server
+      pc.x = lerp(pc.x, sc.x, 0.15);
+      pc.y = lerp(pc.y, sc.y, 0.15);
+    }
+    // Always trust server for mass
+    pc.mass = sc.mass; pc.r = sc.r;
+  }
+}
+
+// ─── Socket events ────────────────────────────────────────────────────────────
+socket.on('joined', ({ id, color }) => { myId = id; myColor = color; });
+
+socket.on('state', snap => {
+  // Reconcile own player
+  const me = snap.players.find(p => p.isYou);
+  if (me) reconcile(me.cells);
+
+  // Buffer snapshot for interpolating other players
+  snapBuf.push({ time: Date.now(), snap });
+  if (snapBuf.length > 15) snapBuf.shift();
+
+  // Always use latest leaderboard
+  if (snap.leaderboard) lastLeaderboard = snap.leaderboard;
 });
 
-// ─── Interpolation ────────────────────────────────────────────────────────────
-function lerp(a, b, t) { return a + (b - a) * t; }
+socket.on('dead', ({ killer }) => {
+  playing = false;
+  const mass = predicted ? Math.floor(predicted.cells.reduce((s,c) => s+c.mass, 0)) : 0;
+  predicted = null;
+  showDeathScreen(killer, mass);
+});
 
-// Find the interpolated frame for render time `rt`
-function getFrame(rt) {
-  if (!buf.length) return null;
+// ─── Send input every frame ───────────────────────────────────────────────────
+function sendInput() {
+  if (!playing || !predicted || !predicted.cells.length) return;
+  const cx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
+  const cy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
+  const { tx, ty } = getServerTarget(cx, cy);
+  socket.emit('input', { tx, ty });
+}
 
-  // Find the two buffer entries that bracket rt
+// ─── Other-player interpolation ───────────────────────────────────────────────
+function getOthersFrame() {
+  if (snapBuf.length < 2) return snapBuf.length ? snapBuf[snapBuf.length-1].snap : null;
+  const renderTime = Date.now() - RENDER_DELAY;
+
   let before = null, after = null;
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i].time <= rt) before = buf[i];
-    else { after = buf[i]; break; }
+  for (let i = 0; i < snapBuf.length; i++) {
+    if (snapBuf[i].time <= renderTime) before = snapBuf[i];
+    else { after = snapBuf[i]; break; }
   }
 
-  // If no bracket found, clamp to what we have
-  if (!before) return buf[0].snap;
-  if (!after)  return buf[buf.length - 1].snap;
+  if (!before) return snapBuf[0].snap;
+  if (!after)  return snapBuf[snapBuf.length-1].snap;
 
-  // Interpolation factor 0→1 between before and after
-  const range = after.time - before.time;
-  const t = range > 0 ? (rt - before.time) / range : 1;
-
+  const t = Math.min(1, (renderTime - before.time) / (after.time - before.time));
   const a = before.snap, b = after.snap;
 
-  // Build cell lookup maps for fast matching
-  const playerMapA = new Map();
+  const mapA = new Map();
   for (const p of a.players) {
-    const cells = new Map();
-    for (const c of p.cells) cells.set(c.id, c);
-    playerMapA.set(p.id, cells);
+    const cm = new Map(); for (const c of p.cells) cm.set(c.id, c);
+    mapA.set(p.id, cm);
   }
 
-  const players = b.players.map(pb => {
-    const cellsA = playerMapA.get(pb.id);
-    const cells = pb.cells.map(cb => {
-      const ca = cellsA?.get(cb.id);
-      if (!ca) return cb; // new cell — just show at target position
-      return {
-        ...cb,
-        x: lerp(ca.x, cb.x, t),
-        y: lerp(ca.y, cb.y, t),
-        r: lerp(ca.r, cb.r, t),
-      };
+  const players = b.players
+    .filter(p => !p.isYou)
+    .map(pb => {
+      const cellsA = mapA.get(pb.id);
+      return { ...pb, cells: pb.cells.map(cb => {
+        const ca = cellsA?.get(cb.id);
+        if (!ca) return cb;
+        return { ...cb, x: lerp(ca.x, cb.x, t), y: lerp(ca.y, cb.y, t), r: lerp(ca.r, cb.r, t) };
+      })};
     });
-    return { ...pb, cells };
-  });
 
-  return { ...b, players };
+  return { ...b, players, food: b.food, viruses: b.viruses };
 }
 
 // ─── Draw helpers ─────────────────────────────────────────────────────────────
@@ -203,23 +379,23 @@ function adjustColor(col, amt) {
   if (!col.startsWith('#')) return col;
   let s = col.slice(1);
   if (s.length === 3) s = s.split('').map(c => c+c).join('');
-  const r = Math.min(255, Math.max(0, parseInt(s.slice(0,2),16)+amt));
-  const g = Math.min(255, Math.max(0, parseInt(s.slice(2,4),16)+amt));
-  const b = Math.min(255, Math.max(0, parseInt(s.slice(4,6),16)+amt));
+  const r = clamp(parseInt(s.slice(0,2),16)+amt, 0, 255);
+  const g = clamp(parseInt(s.slice(2,4),16)+amt, 0, 255);
+  const b = clamp(parseInt(s.slice(4,6),16)+amt, 0, 255);
   return `rgb(${r},${g},${b})`;
 }
 
-function drawCell(c, color, name, isYou) {
-  const sx = (c.x - cam.x)*cam.scale + canvas.width/2;
-  const sy = (c.y - cam.y)*cam.scale + canvas.height/2;
-  const sr = c.r * cam.scale;
+function drawCell(x, y, r, color, name, isYou) {
+  const sx = (x - cam.x)*cam.scale + canvas.width/2;
+  const sy = (y - cam.y)*cam.scale + canvas.height/2;
+  const sr = r * cam.scale;
   if (sx+sr < 0 || sx-sr > canvas.width || sy+sr < 0 || sy-sr > canvas.height) return;
-  const grad = ctx.createRadialGradient(sx-sr*0.3, sy-sr*0.3, sr*0.05, sx, sy, sr);
-  grad.addColorStop(0, adjustColor(color, 50));
-  grad.addColorStop(0.6, color);
-  grad.addColorStop(1, adjustColor(color, -30));
+  const g = ctx.createRadialGradient(sx-sr*0.3, sy-sr*0.3, sr*0.05, sx, sy, sr);
+  g.addColorStop(0, adjustColor(color, 50));
+  g.addColorStop(0.6, color);
+  g.addColorStop(1, adjustColor(color, -30));
   ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI*2);
-  ctx.fillStyle = grad; ctx.fill();
+  ctx.fillStyle = g; ctx.fill();
   ctx.strokeStyle = isYou ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.25)';
   ctx.lineWidth = isYou ? Math.max(2, sr*0.05) : Math.max(1, sr*0.04);
   ctx.stroke();
@@ -244,22 +420,17 @@ function drawGrid() {
 
 function drawBorder() {
   ctx.strokeStyle = 'rgba(100,200,255,0.25)'; ctx.lineWidth = 2;
-  ctx.strokeRect(
-    (0 - cam.x)*cam.scale + canvas.width/2,
-    (0 - cam.y)*cam.scale + canvas.height/2,
-    3000*cam.scale, 3000*cam.scale
-  );
+  ctx.strokeRect((0-cam.x)*cam.scale+canvas.width/2, (0-cam.y)*cam.scale+canvas.height/2, WORLD*cam.scale, WORLD*cam.scale);
 }
 
 function drawVirus(v) {
-  const sx = (v.x-cam.x)*cam.scale + canvas.width/2;
-  const sy = (v.y-cam.y)*cam.scale + canvas.height/2;
-  const sr = v.r * cam.scale;
+  const sx = (v.x-cam.x)*cam.scale+canvas.width/2;
+  const sy = (v.y-cam.y)*cam.scale+canvas.height/2;
+  const sr = v.r*cam.scale;
   if (sx+sr<0||sx-sr>canvas.width||sy+sr<0||sy-sr>canvas.height) return;
   ctx.beginPath();
   for (let i = 0; i < 32; i++) {
-    const ang = (i/32)*Math.PI*2;
-    const r = i%2===0 ? sr : sr*0.75;
+    const ang = (i/32)*Math.PI*2, r = i%2===0 ? sr : sr*0.75;
     i===0 ? ctx.moveTo(sx+Math.cos(ang)*r, sy+Math.sin(ang)*r)
            : ctx.lineTo(sx+Math.cos(ang)*r, sy+Math.sin(ang)*r);
   }
@@ -268,67 +439,69 @@ function drawVirus(v) {
   ctx.strokeStyle = 'rgba(50,255,100,0.7)'; ctx.lineWidth = 1.5; ctx.stroke();
 }
 
-// ─── Render loop (60fps) ──────────────────────────────────────────────────────
-function loop() {
+// ─── Render loop ──────────────────────────────────────────────────────────────
+let lastRAF = 0;
+function loop(now) {
   requestAnimationFrame(loop);
+  const dt = Math.min(now - lastRAF, 50); // cap at 50ms
+  lastRAF = now;
+
   sendInput();
 
   ctx.fillStyle = '#0a0a0f';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+
   if (!playing) return;
 
-  // Render at a fixed delay behind "now" so we always have two snapshots
-  const renderTime = Date.now() - RENDER_DELAY;
-  const frame = getFrame(renderTime);
-  if (!frame) return;
+  // Tick client prediction
+  tickPredicted(dt);
 
-  const me = frame.players.find(p => p.isYou);
-  if (!me || !me.cells.length) return;
+  if (!predicted || !predicted.cells.length) return;
 
-  // Update stable player position for input direction
-  lastPlayerCx = me.cells.reduce((s,c) => s+c.x, 0) / me.cells.length;
-  lastPlayerCy = me.cells.reduce((s,c) => s+c.y, 0) / me.cells.length;
+  // Camera target: centroid of predicted cells
+  const pcx = predicted.cells.reduce((s,c) => s+c.x, 0) / predicted.cells.length;
+  const pcy = predicted.cells.reduce((s,c) => s+c.y, 0) / predicted.cells.length;
+  const myMass = predicted.cells.reduce((s,c) => s+c.mass, 0);
 
-  // Smooth camera — zoom based on both mass AND spread of split cells
-  const myMass = me.cells.reduce((s,c) => s+c.mass, 0);
-  const scaleByMass = 64 / (Math.sqrt(myMass)*4 + 10);
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const c of me.cells) {
-    minX = Math.min(minX, c.x - c.r); maxX = Math.max(maxX, c.x + c.r);
-    minY = Math.min(minY, c.y - c.r); maxY = Math.max(maxY, c.y + c.r);
+  // Zoom to fit all own cells
+  let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+  for (const c of predicted.cells) {
+    minX=Math.min(minX,c.x-c.r); maxX=Math.max(maxX,c.x+c.r);
+    minY=Math.min(minY,c.y-c.r); maxY=Math.max(maxY,c.y+c.r);
   }
-  const scaleBySpread = Math.min(
-    (canvas.width  * 0.7) / Math.max(maxX - minX, 1),
-    (canvas.height * 0.7) / Math.max(maxY - minY, 1)
-  );
-  const targetScale = Math.min(1.2, Math.max(0.15, Math.min(scaleByMass, scaleBySpread)));
-  cam.x = lerp(cam.x, lastPlayerCx, 0.1);
-  cam.y = lerp(cam.y, lastPlayerCy, 0.1);
-  cam.scale = lerp(cam.scale, targetScale, 0.05);
+  const scaleByMass   = 64 / (Math.sqrt(myMass)*4 + 10);
+  const scaleBySpread = Math.min((canvas.width*0.7)/Math.max(maxX-minX,1), (canvas.height*0.7)/Math.max(maxY-minY,1));
+  const targetScale   = clamp(Math.min(scaleByMass, scaleBySpread), 0.15, 1.2);
+
+  cam.x     = lerp(cam.x, pcx, 0.1);
+  cam.y     = lerp(cam.y, pcy, 0.1);
+  cam.scale = lerp(cam.scale, targetScale, 0.06);
 
   drawGrid();
   drawBorder();
 
-  // Food
-  for (const f of frame.food) {
-    const sx = (f.x-cam.x)*cam.scale + canvas.width/2;
-    const sy = (f.y-cam.y)*cam.scale + canvas.height/2;
-    const sr = Math.max(1.5, f.r*cam.scale);
-    ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2);
-    ctx.fillStyle = f.color; ctx.fill();
+  // Get other players from interpolated server buffer
+  const frame = getOthersFrame();
+
+  // Food & viruses from server (no need to predict these)
+  if (frame) {
+    for (const f of frame.food) {
+      const sx=(f.x-cam.x)*cam.scale+canvas.width/2, sy=(f.y-cam.y)*cam.scale+canvas.height/2;
+      const sr=Math.max(1.5,f.r*cam.scale);
+      ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2); ctx.fillStyle=f.color; ctx.fill();
+    }
+    for (const v of frame.viruses) drawVirus(v);
+    // Draw other players (interpolated)
+    for (const p of frame.players)
+      for (const c of p.cells) drawCell(c.x, c.y, c.r, p.color, p.name, false);
   }
 
-  // Viruses
-  for (const v of frame.viruses) drawVirus(v);
-
-  // Players (others behind, self on top)
-  const sorted = [...frame.players].sort((a,b) => a.isYou - b.isYou);
-  for (const p of sorted)
-    for (const c of p.cells) drawCell(c, p.color, p.name, p.isYou);
+  // Draw own cells from CLIENT PREDICTION (zero-latency)
+  for (const c of predicted.cells) drawCell(c.x, c.y, c.r, myColor, myName, true);
 
   // HUD
   document.getElementById('mass-val').textContent = Math.floor(myMass);
-  document.getElementById('leaderboard-list').innerHTML = frame.leaderboard
+  document.getElementById('leaderboard-list').innerHTML = lastLeaderboard
     .map((e,i) => `<li class="${e.isYou?'you':''}"><span>#${i+1}</span>${e.name}<span>${e.mass}</span></li>`)
     .join('');
 }
@@ -360,6 +533,7 @@ function respawn() {
   myName = document.getElementById('name-input').value.trim() || myName;
   socket.emit('respawn', { name: myName });
   playing = true;
+  predicted = null;
   document.getElementById('overlay').style.display = 'none';
 }
 
