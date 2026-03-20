@@ -20,9 +20,12 @@ const CFG = {
   playerStartMass: 10,
   maxSplitPieces: 4,
   splitCooldown: 500,
+  splitMomentumDecay: 0.82,   // how fast split velocity fades
+  splitMomentumTicks: 20,     // ticks before normal steering resumes
   mergeCooldown: 3000,
-  ejectMass: 14,
-  ejectMinMass: 30,
+  ejectMass: 12,
+  ejectMinMass: 20,           // lowered so you can eject earlier
+  splitMinMass: 16,           // lowered: splits into two 8s
   tickRate: 30,
   massDecay: 0.001,
 };
@@ -38,11 +41,7 @@ let nextId = 1;
 const uid = () => nextId++;
 
 // ─── World State ──────────────────────────────────────────────────────────────
-const state = {
-  players: new Map(),
-  food: [],
-  viruses: [],
-};
+const state = { players: new Map(), food: [], viruses: [] };
 
 // ─── Food & Viruses ───────────────────────────────────────────────────────────
 function spawnFood(n = 1) {
@@ -72,13 +71,19 @@ function makePlayer(id, name, color) {
     id, name, color,
     dead: false,
     splitCooldown: 0,
-    input: { tx: CFG.worldW / 2, ty: CFG.worldH / 2, split: false, eject: false },
+    input: { tx: CFG.worldW / 2, ty: CFG.worldH / 2 },
     cells: [makeCell(rand(200, CFG.worldW-200), rand(200, CFG.worldH-200), CFG.playerStartMass, color, name)],
   };
 }
 
 function makeCell(x, y, mass, color, name) {
-  return { id: uid(), x, y, mass, r: massToRadius(mass), color, name, vx: 0, vy: 0, splitTimer: 0 };
+  return {
+    id: uid(), x, y, mass, r: massToRadius(mass),
+    color, name,
+    vx: 0, vy: 0,
+    splitTimer: 0,
+    splitTick: 999,   // ticks since split (for momentum)
+  };
 }
 
 // ─── Player physics ───────────────────────────────────────────────────────────
@@ -86,16 +91,23 @@ function tickPlayer(player, dt) {
   if (player.dead) return;
   player.splitCooldown = Math.max(0, player.splitCooldown - dt);
 
-  if (player.input.split) { player.input.split = false; doSplit(player); }
-  if (player.input.eject) { player.input.eject = false; doEject(player); }
-
   const { tx, ty } = player.input;
 
   for (const c of player.cells) {
     const speed = Math.max(1.5, 6 / Math.sqrt(c.mass / 10));
-    const dx = tx - c.x, dy = ty - c.y;
-    const d = Math.hypot(dx, dy);
-    if (d > 1) { c.vx = (dx / d) * speed; c.vy = (dy / d) * speed; }
+
+    if (c.splitTick < CFG.splitMomentumTicks) {
+      // Still carrying split momentum — decay it
+      c.vx *= CFG.splitMomentumDecay;
+      c.vy *= CFG.splitMomentumDecay;
+      c.splitTick++;
+    } else {
+      // Normal steering toward target
+      const dx = tx - c.x, dy = ty - c.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 1) { c.vx = (dx / d) * speed; c.vy = (dy / d) * speed; }
+    }
+
     c.x = Math.max(c.r, Math.min(CFG.worldW - c.r, c.x + c.vx));
     c.y = Math.max(c.r, Math.min(CFG.worldH - c.r, c.y + c.vy));
     c.splitTimer += dt;
@@ -103,22 +115,24 @@ function tickPlayer(player, dt) {
     c.r = massToRadius(c.mass);
   }
 
-  // Push overlapping own cells apart
-  for (let i = 0; i < player.cells.length; i++) {
-    for (let j = i + 1; j < player.cells.length; j++) {
-      const a = player.cells[i], b = player.cells[j];
-      const d = dist(a, b);
-      const minD = (a.r + b.r) * 0.6;
-      if (d < minD && a.splitTimer < CFG.mergeCooldown) {
-        const ang = Math.atan2(b.y - a.y, b.x - a.x);
-        const push = (minD - d) * 0.3;
-        b.x += Math.cos(ang) * push; b.y += Math.sin(ang) * push;
-        a.x -= Math.cos(ang) * push; a.y -= Math.sin(ang) * push;
+  // Push overlapping own cells apart — run multiple iterations so they fully separate
+  for (let iter = 0; iter < 3; iter++) {
+    for (let i = 0; i < player.cells.length; i++) {
+      for (let j = i + 1; j < player.cells.length; j++) {
+        const a = player.cells[i], b = player.cells[j];
+        const d = dist(a, b);
+        const minD = a.r + b.r;   // full diameter, not 60%
+        if (d < minD) {
+          const ang = Math.atan2(b.y - a.y, b.x - a.x) || 0;
+          const push = (minD - d) * 0.5;  // stronger push per iter
+          b.x += Math.cos(ang) * push; b.y += Math.sin(ang) * push;
+          a.x -= Math.cos(ang) * push; a.y -= Math.sin(ang) * push;
+        }
       }
     }
   }
 
-  // Re-merge cells after cooldown
+  // Merge cells after cooldown
   if (player.cells.length > 1) {
     for (let i = player.cells.length - 1; i > 0; i--) {
       const c = player.cells[i];
@@ -132,28 +146,49 @@ function tickPlayer(player, dt) {
 }
 
 function doSplit(player) {
-  if (player.splitCooldown > 0 || player.cells.length >= CFG.maxSplitPieces) return;
+  if (player.splitCooldown > 0) return;
   const { tx, ty } = player.input;
+  let didSplit = false;
+
   for (const c of [...player.cells]) {
-    if (c.mass < 20 || player.cells.length >= CFG.maxSplitPieces) continue;
+    if (player.cells.length >= CFG.maxSplitPieces) break;
+    if (c.mass < CFG.splitMinMass) continue;
+
     const half = c.mass / 2;
     c.mass = half; c.r = massToRadius(half);
+
     const ang = Math.atan2(ty - c.y, tx - c.x);
-    const nc = makeCell(c.x + Math.cos(ang)*c.r, c.y + Math.sin(ang)*c.r, half, player.color, player.name);
-    nc.vx = Math.cos(ang) * 14;
-    nc.vy = Math.sin(ang) * 14;
+    const nc = makeCell(
+      c.x + Math.cos(ang) * (c.r * 2.2),  // spawn outside parent cell
+      c.y + Math.sin(ang) * (c.r * 2.2),
+      half, player.color, player.name
+    );
+    // Launch with momentum — faster so it actually flies out
+    const launchSpeed = Math.max(14, 22 / Math.sqrt(half / 10));
+    nc.vx = Math.cos(ang) * launchSpeed;
+    nc.vy = Math.sin(ang) * launchSpeed;
+    nc.splitTimer = 0;
+    nc.splitTick = 0;
     player.cells.push(nc);
+    didSplit = true;
   }
-  player.splitCooldown = CFG.splitCooldown;
+
+  if (didSplit) player.splitCooldown = CFG.splitCooldown;
 }
 
 function doEject(player) {
   const { tx, ty } = player.input;
   for (const c of player.cells) {
     if (c.mass < CFG.ejectMinMass) continue;
-    c.mass -= CFG.ejectMass; c.r = massToRadius(c.mass);
+    c.mass -= CFG.ejectMass;
+    c.r = massToRadius(c.mass);
     const ang = Math.atan2(ty - c.y, tx - c.x);
-    state.food.push({ id: uid(), x: c.x + Math.cos(ang)*c.r*1.1, y: c.y + Math.sin(ang)*c.r*1.1, color: c.color, r: 7, mass: CFG.ejectMass * 0.5 });
+    state.food.push({
+      id: uid(),
+      x: c.x + Math.cos(ang) * (c.r + 10),
+      y: c.y + Math.sin(ang) * (c.r + 10),
+      color: c.color, r: 7, mass: CFG.ejectMass * 0.8,
+    });
   }
 }
 
@@ -161,18 +196,19 @@ function doEject(player) {
 function tickEating() {
   const alive = [...state.players.values()].filter(p => !p.dead);
 
-  // Eat food
   for (const player of alive) {
     for (const c of player.cells) {
       for (let i = state.food.length - 1; i >= 0; i--) {
         const f = state.food[i];
-        if (dist(c, f) < c.r - f.r * 0.5) { c.mass += f.mass; c.r = massToRadius(c.mass); state.food.splice(i, 1); }
+        if (dist(c, f) < c.r - f.r * 0.5) {
+          c.mass += f.mass; c.r = massToRadius(c.mass);
+          state.food.splice(i, 1);
+        }
       }
     }
   }
   while (state.food.length < CFG.foodCount) spawnFood(10);
 
-  // Players eat each other
   for (let i = 0; i < alive.length; i++) {
     for (let j = 0; j < alive.length; j++) {
       if (i === j) continue;
@@ -192,10 +228,9 @@ function tickEating() {
       }
     }
   }
-
 }
 
-// ─── Snapshot (viewport-culled) ───────────────────────────────────────────────
+// ─── Snapshot ─────────────────────────────────────────────────────────────────
 function buildSnapshot(playerId) {
   const player = state.players.get(playerId);
   if (!player || player.dead) return null;
@@ -218,7 +253,7 @@ function buildSnapshot(playerId) {
 
   return {
     players: nearbyPlayers,
-    food:    state.food.filter(f => dist({x:cx,y:cy}, f) < viewR),
+    food: state.food.filter(f => dist({x:cx,y:cy}, f) < viewR),
     viruses: state.viruses.filter(v => dist({x:cx,y:cy}, v) < viewR),
     leaderboard,
   };
@@ -250,14 +285,21 @@ io.on('connection', socket => {
     console.log(`[join] ${safeName}`);
   });
 
-  // Client sends world-space mouse position directly
   socket.on('input', ({ tx, ty }) => {
     const p = state.players.get(socket.id);
     if (p) { p.input.tx = tx; p.input.ty = ty; }
   });
 
-  socket.on('split',   () => { const p = state.players.get(socket.id); if (p) p.input.split  = true; });
-  socket.on('eject',   () => { const p = state.players.get(socket.id); if (p) p.input.eject  = true; });
+  // Split and eject processed immediately on receipt for responsiveness
+  socket.on('split', () => {
+    const p = state.players.get(socket.id);
+    if (p && !p.dead) doSplit(p);
+  });
+
+  socket.on('eject', () => {
+    const p = state.players.get(socket.id);
+    if (p && !p.dead) doEject(p);
+  });
 
   socket.on('respawn', ({ name }) => {
     const p = state.players.get(socket.id);
@@ -268,6 +310,8 @@ io.on('connection', socket => {
     p.splitCooldown = 0;
     p.cells = [makeCell(rand(200, CFG.worldW-200), rand(200, CFG.worldH-200), CFG.playerStartMass, p.color, safeName)];
   });
+
+  socket.on('ping_', () => socket.emit('pong_'));
 
   socket.on('disconnect', () => {
     state.players.delete(socket.id);
@@ -280,4 +324,4 @@ spawnFood(CFG.foodCount);
 spawnViruses();
 setInterval(gameLoop, TICK_MS);
 
-httpServer.listen(PORT, () => console.log(`Agario multiplayer → http://localhost:${PORT}`));
+httpServer.listen(PORT, '0.0.0.0', () => console.log(`Agario multiplayer → http://localhost:${PORT}`));
